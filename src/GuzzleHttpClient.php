@@ -11,24 +11,33 @@ use GuzzleHttp\Exception\RequestException as GuzzleRequestException;
 use Marko\Http\Contracts\HttpClientInterface;
 use Marko\Http\Exceptions\ConnectionException;
 use Marko\Http\Exceptions\HttpException;
+use Marko\Http\Exceptions\InvalidRequestOptionException;
 use Marko\Http\HttpResponse;
+use Marko\Http\RequestOptions;
 
 class GuzzleHttpClient implements HttpClientInterface
 {
+    /**
+     * Driver-specific escape hatch: an array merged verbatim into the Guzzle
+     * request options. Not portable across HttpClientInterface drivers.
+     */
+    public const string GUZZLE_OPTIONS = 'guzzle';
+
     private ?GuzzleClientInterface $client = null;
 
     /**
      * @param array<string, mixed> $options
      *
-     * @throws HttpException|ConnectionException
+     * @throws HttpException|ConnectionException|InvalidRequestOptionException
      */
     public function request(
         string $method,
         string $url,
         array $options = [],
     ): HttpResponse {
+        $guzzleOptions = $this->buildOptions($options);
+
         try {
-            $guzzleOptions = $this->buildOptions($options);
             $response = $this->client()->request($method, $url, $guzzleOptions);
 
             return new HttpResponse(
@@ -55,7 +64,7 @@ class GuzzleHttpClient implements HttpClientInterface
     /**
      * @param array<string, mixed> $options
      *
-     * @throws HttpException|ConnectionException
+     * @throws HttpException|ConnectionException|InvalidRequestOptionException
      */
     public function get(
         string $url,
@@ -67,7 +76,7 @@ class GuzzleHttpClient implements HttpClientInterface
     /**
      * @param array<string, mixed> $options
      *
-     * @throws HttpException|ConnectionException
+     * @throws HttpException|ConnectionException|InvalidRequestOptionException
      */
     public function post(
         string $url,
@@ -79,7 +88,7 @@ class GuzzleHttpClient implements HttpClientInterface
     /**
      * @param array<string, mixed> $options
      *
-     * @throws HttpException|ConnectionException
+     * @throws HttpException|ConnectionException|InvalidRequestOptionException
      */
     public function put(
         string $url,
@@ -91,7 +100,7 @@ class GuzzleHttpClient implements HttpClientInterface
     /**
      * @param array<string, mixed> $options
      *
-     * @throws HttpException|ConnectionException
+     * @throws HttpException|ConnectionException|InvalidRequestOptionException
      */
     public function patch(
         string $url,
@@ -103,7 +112,7 @@ class GuzzleHttpClient implements HttpClientInterface
     /**
      * @param array<string, mixed> $options
      *
-     * @throws HttpException|ConnectionException
+     * @throws HttpException|ConnectionException|InvalidRequestOptionException
      */
     public function delete(
         string $url,
@@ -130,32 +139,39 @@ class GuzzleHttpClient implements HttpClientInterface
     private function buildOptions(
         array $options,
     ): array {
-        $guzzleOptions = ['http_errors' => true];
+        RequestOptions::validate($options, [self::GUZZLE_OPTIONS]);
 
-        if (isset($options['headers'])) {
-            $guzzleOptions['headers'] = $options['headers'];
+        $escapeHatch = $options[self::GUZZLE_OPTIONS] ?? [];
+
+        if (!is_array($escapeHatch)) {
+            throw InvalidRequestOptionException::invalidType(self::GUZZLE_OPTIONS, 'array', $escapeHatch);
         }
 
-        if (isset($options['body'])) {
-            $guzzleOptions['body'] = $options['body'];
+        unset($options[self::GUZZLE_OPTIONS]);
+
+        $guzzleOptions = $options;
+        $guzzleOptions[RequestOptions::HTTP_ERRORS] = RequestOptions::throwsOnHttpError($options);
+
+        $bearerToken = RequestOptions::bearerToken($options);
+
+        if ($bearerToken !== null) {
+            unset($guzzleOptions[RequestOptions::AUTH]);
+            $headers = $options[RequestOptions::HEADERS] ?? [];
+            $headers['Authorization'] = "Bearer $bearerToken";
+            $guzzleOptions[RequestOptions::HEADERS] = $headers;
         }
 
-        if (isset($options['json'])) {
-            $guzzleOptions['json'] = $options['json'];
+        if (is_int($options[RequestOptions::ALLOW_REDIRECTS] ?? null)) {
+            $guzzleOptions[RequestOptions::ALLOW_REDIRECTS] = ['max' => $options[RequestOptions::ALLOW_REDIRECTS]];
         }
 
-        if (isset($options['query'])) {
-            $guzzleOptions['query'] = $options['query'];
-        }
-
-        if (isset($options['timeout'])) {
-            $guzzleOptions['timeout'] = $options['timeout'];
-        }
-
-        return $guzzleOptions;
+        return array_replace($guzzleOptions, $escapeHatch);
     }
 
     /**
+     * Repeated header values are joined with ", ". This is lossy for headers
+     * such as Set-Cookie whose values may themselves contain commas.
+     *
      * @param array<string, array<string>> $headers
      *
      * @return array<string, string>
