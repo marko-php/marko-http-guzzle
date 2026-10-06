@@ -539,3 +539,165 @@ describe('GuzzleHttpClient safe defaults', function (): void {
         }
     });
 });
+
+describe('GuzzleHttpClient resolve_to', function (): void {
+    it('pins the connection with CURLOPT_RESOLVE for the URL host and default port', function (
+        string $url,
+        string $address,
+        string $entry,
+    ): void {
+        $mock = new MockHandler([new Response(200)]);
+        $history = [];
+        $client = createTestableClient($mock, $history);
+
+        $client->post($url, ['resolve_to' => $address, 'allow_redirects' => false]);
+
+        expect($history[0]['options']['curl'][CURLOPT_RESOLVE])->toBe([$entry])
+            ->and($history[0]['options']['curl'][CURLOPT_FRESH_CONNECT])->toBeTrue()
+            ->and($history[0]['options'])->not->toHaveKey('resolve_to')
+            ->and($history[0]['request']->getHeaderLine('Host'))->toBe(parse_url($url, PHP_URL_HOST)
+                . (parse_url($url, PHP_URL_PORT) !== null ? ':' . parse_url($url, PHP_URL_PORT) : ''));
+    })->with([
+        'https default port' => ['https://hooks.example.com/in', '93.184.215.14', 'hooks.example.com:443:93.184.215.14'],
+        'http default port' => ['http://hooks.example.com/in', '93.184.215.14', 'hooks.example.com:80:93.184.215.14'],
+        'explicit port' => ['https://hooks.example.com:8443/in', '93.184.215.14', 'hooks.example.com:8443:93.184.215.14'],
+        'ipv6 address' => ['https://hooks.example.com/in', '2606:2800:21f::1', 'hooks.example.com:443:[2606:2800:21f::1]'],
+    ]);
+
+    it('sets no curl options when resolve_to is absent', function (): void {
+        $mock = new MockHandler([new Response(200)]);
+        $history = [];
+        $client = createTestableClient($mock, $history);
+
+        $client->get('https://example.com/a');
+
+        expect($history[0]['options'])->not->toHaveKey('curl');
+    });
+
+    it('keeps other escape-hatch curl options alongside the pin', function (): void {
+        $mock = new MockHandler([new Response(200)]);
+        $history = [];
+        $client = createTestableClient($mock, $history);
+
+        $client->get('https://example.com/a', [
+            'resolve_to' => '93.184.215.14',
+            'allow_redirects' => false,
+            'guzzle' => ['curl' => [CURLOPT_TCP_NODELAY => true]],
+        ]);
+
+        expect($history[0]['options']['curl'][CURLOPT_TCP_NODELAY])->toBeTrue()
+            ->and($history[0]['options']['curl'][CURLOPT_RESOLVE])->toBe(['example.com:443:93.184.215.14']);
+    });
+
+    it('accepts an IP-literal URL that names the pinned address', function (): void {
+        $mock = new MockHandler([new Response(200)]);
+        $history = [];
+        $client = createTestableClient($mock, $history);
+
+        $client->get('https://[2606:2800:21f::1]/a', [
+            'resolve_to' => '2606:2800:21f:0::1',
+            'allow_redirects' => false,
+        ]);
+
+        expect($history[0]['options']['curl'])->not->toHaveKey(CURLOPT_RESOLVE)
+            ->and($history[0]['options']['curl'][CURLOPT_FRESH_CONNECT])->toBeTrue();
+    });
+
+    it('rejects pinning options that would bypass or override the pin, before sending', function (
+        string $url,
+        array $guzzle,
+        string $message,
+    ): void {
+        $mock = new MockHandler([new Response(200)]);
+        $history = [];
+        $client = createTestableClient($mock, $history);
+
+        expect(fn () => $client->get($url, [
+            'resolve_to' => '93.184.215.14',
+            'allow_redirects' => false,
+            'guzzle' => $guzzle,
+        ]))->toThrow(InvalidRequestOptionException::class, $message)
+            ->and($history)->toBeEmpty();
+    })->with([
+        'streamed request' => ['https://example.com/a', ['stream' => true], "with the 'stream' Guzzle option"],
+        'guzzle proxy' => ['https://example.com/a', ['proxy' => 'http://proxy:8080'], "'guzzle.proxy'"],
+        'guzzle redirects' => ['https://example.com/a', ['allow_redirects' => true], "requires 'allow_redirects' => false"],
+        'curl resolve' => ['https://example.com/a', ['curl' => [CURLOPT_RESOLVE => ['x:443:1.1.1.1']]], 'CURLOPT_RESOLVE'],
+        'curl connect_to' => ['https://example.com/a', ['curl' => [CURLOPT_CONNECT_TO => ['::1.1.1.1:']]], 'CURLOPT_CONNECT_TO'],
+        'curl not an array' => ['https://example.com/a', ['curl' => 'x'], "'guzzle.curl'"],
+        'relative url' => ['/a', [], 'needs an absolute http or https URL'],
+        'ftp url' => ['ftp://example.com/a', [], 'needs an absolute http or https URL'],
+        'different ip literal' => ['https://10.0.0.1/a', [], "'resolve_to' and 'the URL host' cannot be used together"],
+    ]);
+
+    it('connects to the pinned address while sending the original Host header', function (): void {
+        $server = startPinningTestServer();
+
+        try {
+            $client = new GuzzleHttpClient(guzzleConfig());
+            $response = $client->get("http://pinned.marko.invalid:{$server['port']}/hook", [
+                'resolve_to' => '127.0.0.1',
+                'allow_redirects' => false,
+            ]);
+
+            expect($response->statusCode())->toBe(200)
+                ->and($response->body())->toBe("pinned.marko.invalid:{$server['port']}");
+        } finally {
+            proc_terminate($server['process']);
+            proc_close($server['process']);
+            unlink($server['router']);
+        }
+    });
+
+    it('cannot reach a name that does not resolve without resolve_to', function (): void {
+        $client = new GuzzleHttpClient(guzzleConfig(connectTimeout: 5.0));
+
+        expect(fn () => $client->get('http://pinned.marko.invalid/hook'))
+            ->toThrow(ConnectionException::class);
+    });
+});
+
+/**
+ * Starts PHP's built-in server on a free loopback port, answering every request with its Host header.
+ *
+ * @return array{process: resource, port: int, router: string}
+ */
+function startPinningTestServer(): array
+{
+    $socket = stream_socket_server('tcp://127.0.0.1:0');
+    $port = (int) substr((string) strrchr((string) stream_socket_get_name($socket, false), ':'), 1);
+    fclose($socket);
+
+    $router = sys_get_temp_dir() . '/marko-pinning-router-' . getmypid() . '.php';
+    file_put_contents($router, '<?php echo $_SERVER["HTTP_HOST"] ?? "";');
+
+    $process = proc_open(
+        [PHP_BINARY, '-S', "127.0.0.1:$port", $router],
+        [1 => ['file', '/dev/null', 'w'], 2 => ['file', '/dev/null', 'w']],
+        $pipes,
+    );
+
+    // Connection attempts are refused until the server is listening; those warnings are expected.
+    set_error_handler(static fn (): bool => true);
+
+    try {
+        for ($attempt = 0; $attempt < 100; $attempt++) {
+            $connection = fsockopen('127.0.0.1', $port, $errno, $errstr, 0.1);
+
+            if ($connection !== false) {
+                fclose($connection);
+
+                return ['process' => $process, 'port' => $port, 'router' => $router];
+            }
+
+            usleep(20_000);
+        }
+    } finally {
+        restore_error_handler();
+    }
+
+    proc_terminate($process);
+    unlink($router);
+
+    throw new RuntimeException("The pinning test server did not start on port $port.");
+}
