@@ -8,6 +8,8 @@ use GuzzleHttp\Client;
 use GuzzleHttp\ClientInterface as GuzzleClientInterface;
 use GuzzleHttp\Exception\ConnectException as GuzzleConnectException;
 use GuzzleHttp\Exception\RequestException as GuzzleRequestException;
+use Marko\Config\ConfigRepositoryInterface;
+use Marko\Config\Exceptions\ConfigException;
 use Marko\Http\Contracts\HttpClientInterface;
 use Marko\Http\Exceptions\ConnectionException;
 use Marko\Http\Exceptions\HttpException;
@@ -23,7 +25,18 @@ class GuzzleHttpClient implements HttpClientInterface
      */
     public const string GUZZLE_OPTIONS = 'guzzle';
 
+    /**
+     * Matches absolute URLs in an exception message, capturing the scheme,
+     * the optional userinfo, the host and path, and the optional query and
+     * fragment, so the secrets in userinfo and the query can be redacted.
+     */
+    private const string URL_PATTERN = '~\b([a-z][a-z0-9+.\-]*://)([^\s/?#@`\'"<>]*@)?([^\s?#`\'"<>]*)([?#][^\s`\'"<>]*)?~i';
+
     private ?GuzzleClientInterface $client = null;
+
+    public function __construct(
+        private readonly ConfigRepositoryInterface $config,
+    ) {}
 
     /**
      * @param array<string, mixed> $options
@@ -46,7 +59,7 @@ class GuzzleHttpClient implements HttpClientInterface
                 $response->getHeaders(),
             );
         } catch (GuzzleConnectException $e) {
-            throw new ConnectionException($e->getMessage(), previous: $e);
+            throw new ConnectionException($this->redactUrls($e->getMessage()), previous: $e);
         } catch (GuzzleRequestException $e) {
             $response = $e->getResponse();
             $httpResponse = $response !== null
@@ -57,7 +70,7 @@ class GuzzleHttpClient implements HttpClientInterface
                 )
                 : null;
 
-            throw new HttpException($e->getMessage(), $httpResponse, previous: $e);
+            throw new HttpException($this->redactUrls($e->getMessage()), $httpResponse, previous: $e);
         }
     }
 
@@ -151,6 +164,8 @@ class GuzzleHttpClient implements HttpClientInterface
 
         $guzzleOptions = $options;
         $guzzleOptions[RequestOptions::HTTP_ERRORS] = RequestOptions::throwsOnHttpError($options);
+        $guzzleOptions[RequestOptions::TIMEOUT] ??= $this->timeoutFromConfig('timeout');
+        $guzzleOptions[RequestOptions::CONNECT_TIMEOUT] ??= $this->timeoutFromConfig('connect_timeout');
 
         $bearerToken = RequestOptions::bearerToken($options);
 
@@ -166,6 +181,49 @@ class GuzzleHttpClient implements HttpClientInterface
         }
 
         return array_replace($guzzleOptions, $escapeHatch);
+    }
+
+    /**
+     * @throws ConfigException
+     */
+    private function timeoutFromConfig(
+        string $name,
+    ): float {
+        $key = "http-guzzle.$name";
+        $seconds = $this->config->getFloat(key: $key);
+
+        if ($seconds < 0) {
+            throw new ConfigException(
+                message: sprintf('Configuration key "%s" must not be negative', $key),
+                context: sprintf('Got %s', $seconds),
+                suggestion: sprintf(
+                    'Set %s to a number of seconds (0 waits forever) in config/http-guzzle.php, or pass "%s" per request.',
+                    $key,
+                    $name,
+                ),
+            );
+        }
+
+        return $seconds;
+    }
+
+    /**
+     * Guzzle puts the full request URL in its exception messages, and those
+     * messages end up in logs. Strip userinfo and replace the query string so
+     * credentials and API keys passed in the URL are not leaked. The original
+     * Guzzle exception stays available as the previous exception.
+     */
+    private function redactUrls(
+        string $message,
+    ): string {
+        return (string) preg_replace_callback(
+            self::URL_PATTERN,
+            static fn (array $matches): string => $matches[1]
+                . (($matches[2] ?? '') !== '' ? '***@' : '')
+                . $matches[3]
+                . (str_starts_with($matches[4] ?? '', '?') ? '?…' : ''),
+            $message,
+        );
     }
 
     /**

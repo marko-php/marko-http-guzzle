@@ -11,26 +11,44 @@ use GuzzleHttp\HandlerStack;
 use GuzzleHttp\Middleware;
 use GuzzleHttp\Psr7\Request;
 use GuzzleHttp\Psr7\Response;
+use Marko\Config\Exceptions\ConfigException;
 use Marko\Http\Contracts\HttpClientInterface;
 use Marko\Http\Exceptions\ConnectionException;
 use Marko\Http\Exceptions\HttpException;
 use Marko\Http\Exceptions\InvalidRequestOptionException;
 use Marko\Http\Guzzle\GuzzleHttpClient;
 use Marko\Http\HttpResponse;
+use Marko\Testing\Fake\FakeConfigRepository;
+
+function guzzleConfig(
+    float $timeout = 30.0,
+    float $connectTimeout = 10.0,
+): FakeConfigRepository {
+    return new FakeConfigRepository([
+        'http-guzzle.timeout' => $timeout,
+        'http-guzzle.connect_timeout' => $connectTimeout,
+    ]);
+}
 
 function createTestableClient(
     MockHandler $mock,
     array &$history = [],
+    float $timeout = 30.0,
+    float $connectTimeout = 10.0,
 ): GuzzleHttpClient {
     $handlerStack = HandlerStack::create($mock);
     $handlerStack->push(Middleware::history($history));
     $guzzle = new Client(['handler' => $handlerStack]);
+    $config = guzzleConfig($timeout, $connectTimeout);
 
-    return new class ($guzzle) extends GuzzleHttpClient
+    return new class ($guzzle, $config) extends GuzzleHttpClient
     {
         public function __construct(
             private readonly GuzzleClientInterface $testClient,
-        ) {}
+            FakeConfigRepository $config,
+        ) {
+            parent::__construct($config);
+        }
 
         protected function createClient(): GuzzleClientInterface
         {
@@ -41,7 +59,7 @@ function createTestableClient(
 
 describe('GuzzleHttpClient', function (): void {
     it('implements HttpClientInterface', function (): void {
-        $client = new GuzzleHttpClient();
+        $client = new GuzzleHttpClient(guzzleConfig());
 
         expect($client)->toBeInstanceOf(HttpClientInterface::class);
     });
@@ -405,6 +423,119 @@ describe('GuzzleHttpClient request options', function (): void {
         } catch (HttpException $e) {
             expect($e->getResponse()?->headerValues('set-cookie'))
                 ->toBe(['a=1; Expires=Wed, 21 Oct 2026 07:28:00 GMT', 'b=2']);
+        }
+    });
+});
+
+describe('GuzzleHttpClient safe defaults', function (): void {
+    it('applies a default timeout and connect_timeout so a slow upstream cannot hang a worker', function (): void {
+        $mock = new MockHandler([new Response(200)]);
+        $history = [];
+        $client = createTestableClient($mock, $history);
+
+        $client->get('https://example.com/api');
+
+        expect($history[0]['options']['timeout'])->toBe(30.0)
+            ->and($history[0]['options']['connect_timeout'])->toBe(10.0);
+    });
+
+    it('uses the timeouts from config', function (): void {
+        $mock = new MockHandler([new Response(200)]);
+        $history = [];
+        $client = createTestableClient($mock, $history, timeout: 5.0, connectTimeout: 1.5);
+
+        $client->get('https://example.com/api');
+
+        expect($history[0]['options']['timeout'])->toBe(5.0)
+            ->and($history[0]['options']['connect_timeout'])->toBe(1.5);
+    });
+
+    it('lets per-request timeout options override the defaults', function (): void {
+        $mock = new MockHandler([new Response(200)]);
+        $history = [];
+        $client = createTestableClient($mock, $history);
+
+        $client->get('https://example.com/api', ['timeout' => 0, 'connect_timeout' => 3]);
+
+        expect($history[0]['options']['timeout'])->toBe(0)
+            ->and($history[0]['options']['connect_timeout'])->toBe(3);
+    });
+
+    it('rejects a negative configured timeout', function (): void {
+        $client = createTestableClient(new MockHandler([new Response(200)]), timeout: -1.0);
+
+        expect(fn () => $client->get('https://example.com/api'))
+            ->toThrow(ConfigException::class, 'http-guzzle.timeout');
+    });
+
+    it('rejects a negative configured connect_timeout', function (): void {
+        $client = createTestableClient(new MockHandler([new Response(200)]), connectTimeout: -1.0);
+
+        expect(fn () => $client->get('https://example.com/api'))
+            ->toThrow(ConfigException::class, 'http-guzzle.connect_timeout');
+    });
+
+    it('lets the guzzle escape hatch override the configured timeouts', function (): void {
+        $mock = new MockHandler([new Response(200)]);
+        $history = [];
+        $client = createTestableClient($mock, $history);
+
+        $client->get('https://example.com/api', ['guzzle' => ['timeout' => 120, 'connect_timeout' => 0]]);
+
+        expect($history[0]['options']['timeout'])->toBe(120)
+            ->and($history[0]['options']['connect_timeout'])->toBe(0);
+    });
+
+    it('redacts the query string from HttpException messages', function (): void {
+        $mock = new MockHandler([new Response(401, [], 'denied')]);
+        $client = createTestableClient($mock);
+
+        try {
+            $client->get('https://api.example.com/v1/data?api_key=sk_live_SECRET123&page=2');
+            test()->fail('Expected HttpException');
+        } catch (HttpException $e) {
+            expect($e->getMessage())->not->toContain('sk_live_SECRET123')
+                ->and($e->getMessage())->not->toContain('api_key')
+                ->and($e->getMessage())->toContain('https://api.example.com/v1/data?…')
+                ->and($e->getResponse()?->statusCode())->toBe(401);
+        }
+    });
+
+    it('redacts the query string and userinfo from ConnectionException messages', function (): void {
+        $url = 'https://admin:hunter2@api.example.com/v1/data?token=SECRET123';
+        $mock = new MockHandler([
+            new ConnectException(
+                "cURL error 28: Operation timed out (see https://curl.haxx.se/libcurl/c/libcurl-errors.html) for $url",
+                new Request('GET', $url),
+            ),
+        ]);
+        $client = createTestableClient($mock);
+
+        try {
+            $client->get($url);
+            test()->fail('Expected ConnectionException');
+        } catch (ConnectionException $e) {
+            expect($e->getMessage())->not->toContain('SECRET123')
+                ->and($e->getMessage())->not->toContain('hunter2')
+                ->and($e->getMessage())->not->toContain('admin')
+                ->and($e->getMessage())->toContain('cURL error 28: Operation timed out')
+                ->and($e->getMessage())->toContain('https://***@api.example.com/v1/data?…')
+                ->and($e->getMessage())->toContain('https://curl.haxx.se/libcurl/c/libcurl-errors.html');
+        }
+    });
+
+    it('redacts urls in RequestException messages without a response', function (): void {
+        $url = 'https://api.example.com/v1?key=SECRET123#frag';
+        $mock = new MockHandler([
+            new RequestException("Error sending request to $url", new Request('GET', $url)),
+        ]);
+        $client = createTestableClient($mock);
+
+        try {
+            $client->get($url);
+            test()->fail('Expected HttpException');
+        } catch (HttpException $e) {
+            expect($e->getMessage())->toBe('Error sending request to https://api.example.com/v1?…');
         }
     });
 });

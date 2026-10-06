@@ -32,4 +32,11 @@ describe('module.php', function (): void {
 
         expect($composer['extra']['marko']['module'])->toBeTrue();
     });
+
+    it('requires a guzzle release without the 2022 redirect header-leak CVEs', function (): void {
+        $composerPath = dirname(__DIR__, 2) . '/composer.json';
+        $composer = json_decode(file_get_contents($composerPath), true);
+
+        expect($composer['require']['guzzlehttp/guzzle'])->toBe('^7.9');
+    });
 });
