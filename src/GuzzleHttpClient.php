@@ -14,7 +14,6 @@ use Marko\Http\Exceptions\HttpException;
 use Marko\Http\Exceptions\InvalidRequestOptionException;
 use Marko\Http\HttpResponse;
 use Marko\Http\RequestOptions;
-use Psr\Http\Message\ResponseInterface;
 
 class GuzzleHttpClient implements HttpClientInterface
 {
@@ -41,12 +40,22 @@ class GuzzleHttpClient implements HttpClientInterface
         try {
             $response = $this->client()->request($method, $url, $guzzleOptions);
 
-            return $this->toHttpResponse($response);
+            return $this->toHttpResponse(
+                $response->getStatusCode(),
+                (string) $response->getBody(),
+                $response->getHeaders(),
+            );
         } catch (GuzzleConnectException $e) {
             throw new ConnectionException($e->getMessage(), previous: $e);
         } catch (GuzzleRequestException $e) {
             $response = $e->getResponse();
-            $httpResponse = $response !== null ? $this->toHttpResponse($response) : null;
+            $httpResponse = $response !== null
+                ? $this->toHttpResponse(
+                    $response->getStatusCode(),
+                    (string) $response->getBody(),
+                    $response->getHeaders(),
+                )
+                : null;
 
             throw new HttpException($e->getMessage(), $httpResponse, previous: $e);
         }
@@ -162,19 +171,23 @@ class GuzzleHttpClient implements HttpClientInterface
     /**
      * headers() gets one string per header (repeated values joined with ", ");
      * headerValues() keeps every value, so Set-Cookie survives intact.
+     *
+     * @param array<string, array<string>> $rawHeaders
      */
     private function toHttpResponse(
-        ResponseInterface $response,
+        int $statusCode,
+        string $body,
+        array $rawHeaders,
     ): HttpResponse {
         $headerValues = [];
 
-        foreach ($response->getHeaders() as $name => $values) {
+        foreach ($rawHeaders as $name => $values) {
             $headerValues[$name] = array_values($values);
         }
 
         return new HttpResponse(
-            statusCode: $response->getStatusCode(),
-            body: (string) $response->getBody(),
+            statusCode: $statusCode,
+            body: $body,
             headers: $this->flattenHeaders($headerValues),
             headerValues: $headerValues,
         );
