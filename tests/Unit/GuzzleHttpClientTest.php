@@ -378,4 +378,33 @@ describe('GuzzleHttpClient request options', function (): void {
 
         expect($response->headers()['Set-Cookie'])->toBe('a=1; Path=/, b=2; Path=/');
     });
+
+    it('passes repeated response header values through intact', function (): void {
+        $cookies = [
+            'session=abc; Expires=Wed, 21 Oct 2026 07:28:00 GMT; Path=/',
+            'theme=dark; Expires=Thu, 22 Oct 2026 07:28:00 GMT; Path=/',
+        ];
+        $mock = new MockHandler([new Response(200, ['Set-Cookie' => $cookies], '')]);
+        $client = createTestableClient($mock);
+
+        $response = $client->get('https://example.com/api');
+
+        expect($response->headerValues('set-cookie'))->toBe($cookies)
+            ->and($response->header('Set-Cookie'))->toBe(implode(', ', $cookies));
+    });
+
+    it('passes repeated header values through on the response attached to an HttpException', function (): void {
+        $mock = new MockHandler([
+            new Response(401, ['Set-Cookie' => ['a=1; Expires=Wed, 21 Oct 2026 07:28:00 GMT', 'b=2']], ''),
+        ]);
+        $client = createTestableClient($mock);
+
+        try {
+            $client->get('https://example.com/login');
+            test()->fail('Expected HttpException');
+        } catch (HttpException $e) {
+            expect($e->getResponse()?->headerValues('set-cookie'))
+                ->toBe(['a=1; Expires=Wed, 21 Oct 2026 07:28:00 GMT', 'b=2']);
+        }
+    });
 });

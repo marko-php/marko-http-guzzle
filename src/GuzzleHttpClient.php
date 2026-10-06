@@ -14,6 +14,7 @@ use Marko\Http\Exceptions\HttpException;
 use Marko\Http\Exceptions\InvalidRequestOptionException;
 use Marko\Http\HttpResponse;
 use Marko\Http\RequestOptions;
+use Psr\Http\Message\ResponseInterface;
 
 class GuzzleHttpClient implements HttpClientInterface
 {
@@ -40,22 +41,12 @@ class GuzzleHttpClient implements HttpClientInterface
         try {
             $response = $this->client()->request($method, $url, $guzzleOptions);
 
-            return new HttpResponse(
-                statusCode: $response->getStatusCode(),
-                body: (string) $response->getBody(),
-                headers: $this->flattenHeaders($response->getHeaders()),
-            );
+            return $this->toHttpResponse($response);
         } catch (GuzzleConnectException $e) {
             throw new ConnectionException($e->getMessage(), previous: $e);
         } catch (GuzzleRequestException $e) {
             $response = $e->getResponse();
-            $httpResponse = $response !== null
-                ? new HttpResponse(
-                    statusCode: $response->getStatusCode(),
-                    body: (string) $response->getBody(),
-                    headers: $this->flattenHeaders($response->getHeaders()),
-                )
-                : null;
+            $httpResponse = $response !== null ? $this->toHttpResponse($response) : null;
 
             throw new HttpException($e->getMessage(), $httpResponse, previous: $e);
         }
@@ -169,8 +160,30 @@ class GuzzleHttpClient implements HttpClientInterface
     }
 
     /**
+     * headers() gets one string per header (repeated values joined with ", ");
+     * headerValues() keeps every value, so Set-Cookie survives intact.
+     */
+    private function toHttpResponse(
+        ResponseInterface $response,
+    ): HttpResponse {
+        $headerValues = [];
+
+        foreach ($response->getHeaders() as $name => $values) {
+            $headerValues[$name] = array_values($values);
+        }
+
+        return new HttpResponse(
+            statusCode: $response->getStatusCode(),
+            body: (string) $response->getBody(),
+            headers: $this->flattenHeaders($headerValues),
+            headerValues: $headerValues,
+        );
+    }
+
+    /**
      * Repeated header values are joined with ", ". This is lossy for headers
-     * such as Set-Cookie whose values may themselves contain commas.
+     * such as Set-Cookie whose values may themselves contain commas; use
+     * HttpResponse::headerValues() to read each value.
      *
      * @param array<string, array<string>> $headers
      *
